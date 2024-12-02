@@ -1,0 +1,14 @@
+version: '3.1'
+services:
+  dbPostgresql:
+    container_name: postgr
+    image: postgres
+    restart: always
+    ports:
+      - 5432:5432
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 1234
+      POSTGRES_DB: usersAuth
+    volumes:
+      - ./migration/:/docker-entrypoint-initdb.d/

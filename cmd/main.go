@@ -11,8 +11,6 @@ import (
 	"net/http"
 
 	_ "github.com/lib/pq"
-
-	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
 func main() {

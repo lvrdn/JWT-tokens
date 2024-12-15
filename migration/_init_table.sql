@@ -2,7 +2,8 @@ DROP TABLE IF EXISTS "auth";
 CREATE TABLE auth (
     "id" serial PRIMARY KEY,
     "guid" uuid NOT NULL,
-    "refresh_id"  bytea 
+    "refresh_id"  bytea,
+    "exp_date" date
 );
 
 INSERT INTO "auth" ("id", "guid") VALUES

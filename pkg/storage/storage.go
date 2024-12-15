@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"time"
 )
 
 type Storage struct {
@@ -23,19 +24,20 @@ func (st *Storage) CheckGUID(guid string) (int, error) {
 	return id, nil
 }
 
-func (st *Storage) AddNewRefreshID(id int, refreshID []byte) error {
-	_, err := st.DB.Exec("UPDATE auth SET refresh_id=$1 WHERE id=$2", refreshID, id)
+func (st *Storage) AddNewRefreshToken(id int, refreshToken []byte, expDate time.Time) error {
+	_, err := st.DB.Exec("UPDATE auth SET refresh_id=$1, exp_date=$2 WHERE id=$3", refreshToken, expDate, id)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-func (st *Storage) GetHashedRefreshID(id int) ([]byte, error) {
+func (st *Storage) GetHashedRefreshTokenAndExpDate(id int) ([]byte, *time.Time, error) {
 	var refreshID []byte
-	err := st.DB.QueryRow("SELECT refresh_id FROM auth WHERE id=$1", id).Scan(&refreshID)
+	expDate := new(time.Time)
+	err := st.DB.QueryRow("SELECT refresh_id, exp_date FROM auth WHERE id=$1", id).Scan(&refreshID, expDate)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return refreshID, nil
+	return refreshID, expDate, nil
 }

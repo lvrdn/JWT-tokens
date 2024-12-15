@@ -6,34 +6,25 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
+	"time"
 
 	jwt "github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type AuthHandler struct {
+	AccessKey        string
+	AccessExpMinutes int
+	RefreshExpMonths int
 	Storage
 	EmailSender
-	Keys *Keys
-}
-
-type Keys struct {
-	Access  string
-	Refresh string
-}
-
-func NewKeys() *Keys {
-	return &Keys{
-		Access:  "someKey1!",
-		Refresh: "anotherKey123!*",
-	}
 }
 
 type Storage interface {
 	CheckGUID(guid string) (int, error)
-	AddNewRefreshID(id int, refreshID []byte) error
-	GetHashedRefreshID(id int) ([]byte, error)
+	AddNewRefreshToken(id int, refreshID []byte, expDate time.Time) error
+	GetHashedRefreshTokenAndExpDate(id int) ([]byte, *time.Time, error)
 }
 
 type EmailSender interface {
@@ -76,56 +67,68 @@ func (ah *AuthHandler) Issue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	//создание cookie с access токеном
-	cookieWithAccessToken, err := createCookieWithAccessToken(id, r.RemoteAddr, ah.Keys.Access)
-	if err != nil {
-		log.Printf("sign access token error: [%s]\n", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	//создание refresh токена
+	refreshToken, matchingKey := newRefreshToken()
 
-	//создание cookie с refresh токеном
-	refreshID := uuid.New()
-	cookieWithRefreshToken, err := createCookieWithRefreshToken(id, r.RemoteAddr, ah.Keys.Refresh, refreshID.String())
-	if err != nil {
-		log.Printf("sign refresh token error: [%s]\n", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	//добавление сформированного refreshID в базу к id пользователя
-	hashedID, err := bcrypt.GenerateFromPassword([]byte(refreshID.String()), bcrypt.DefaultCost)
+	//добавление сформированного refresh token в базу
+	hashedRefreshToken, err := bcrypt.GenerateFromPassword([]byte(refreshToken), bcrypt.DefaultCost)
 	if err != nil {
 		log.Printf("error with generate bcrypt hash: [%s]\n", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	err = ah.Storage.AddNewRefreshID(id, hashedID)
+	expDate := time.Now().AddDate(0, ah.RefreshExpMonths, 0)
+	err = ah.Storage.AddNewRefreshToken(id, hashedRefreshToken, expDate)
 	if err != nil {
-		log.Printf("error with add new hashed refresh id: [%s]\n", err.Error())
+		log.Printf("error with add new hashed refresh token to db: [%s]\n", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	http.SetCookie(w, cookieWithAccessToken)
-	http.SetCookie(w, cookieWithRefreshToken)
-	w.WriteHeader(http.StatusOK)
+	//создание подписанного access токена
+	signedAccessToken, err := createSignedAccessToken(id, ah.AccessExpMinutes, r.RemoteAddr, ah.AccessKey, matchingKey)
+	if err != nil {
+		log.Printf("create signed access token error: [%s]\n", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "refresh_token",
+		Value:    refreshToken,
+		HttpOnly: true,
+		Path:     "/api/refresh",
+		Expires:  expDate,
+	})
+
+	response := Resp{"access_token": signedAccessToken}
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("error with marshal reponse with access token: reponse [%v], error [%s]\n", response, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Write(responseData)
 }
 
 func (ah *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
+
 	cookie, err := r.Cookie("refresh_token")
-	if err != nil {
+	accessTokenFromReq := r.Header.Get("access_token")
+
+	if err != nil || accessTokenFromReq == "" {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
+
 	refreshTokenFromReq := cookie.Value
 
 	claims := jwt.MapClaims{}
 	_, err = jwt.ParseWithClaims(
-		refreshTokenFromReq,
+		accessTokenFromReq,
 		&claims,
 		func(token *jwt.Token) (interface{}, error) {
-			return []byte(ah.Keys.Refresh), nil
+			return []byte(ah.AccessKey), nil
 		},
 	)
 
@@ -134,24 +137,46 @@ func (ah *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	refreshID := claims["refresh_id"].(string)
-
+	//получение нужных значений из claims
+	matchingKey := claims["matching_key"].(string)
 	id := int(claims["user_id"].(float64))
-	hashedID, err := ah.Storage.GetHashedRefreshID(id)
+	ip := claims["ip"].(string)
+
+	//проверка на наличие самого токена и matching key в полученном refresh токене
+	refreshTokenValues := strings.Split(refreshTokenFromReq, ".")
+	if len(refreshTokenValues) != 2 {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	//проверка на соответствие refresh и access токенов
+	if refreshTokenValues[1] != matchingKey {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	hashedRefreshToken, expDate, err := ah.Storage.GetHashedRefreshTokenAndExpDate(id)
 	if err != nil {
-		log.Printf("check refresh id error: [%s]\n", err.Error())
+		log.Printf("get hashad refresh token error: [%s]\n", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	err = bcrypt.CompareHashAndPassword(hashedID, []byte(refreshID))
+	//проверка срока жизни refresh токена
+	if !time.Now().Before(*expDate) {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+
+	//проверка на соответствие refresh токена из запроса и из базы
+	err = bcrypt.CompareHashAndPassword(hashedRefreshToken, []byte(refreshTokenFromReq))
 	if err != nil {
 		w.WriteHeader(http.StatusUnauthorized)
 		return
 	}
 
 	//отправление warning письма юзеру о доступе к его данным с другого устройства
-	if r.RemoteAddr != claims["ip"] {
+	if r.RemoteAddr != ip {
 		msg := fmt.Sprintf("WARNING, somebody get access to your data\nip: [%s]\nuser-agent: [%s]\nIf this is you, ignore this message\n", r.RemoteAddr, r.UserAgent())
 		email := "some email"
 		err := ah.EmailSender.Send(email, msg)
@@ -160,45 +185,52 @@ func (ah *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		} else {
-			log.Printf("warning msg succesfully sended to [%s]\n", email)
+			log.Printf("warning message succesfully sended to [%s]\n", email)
 		}
-		log.Printf("unknown ip get access to refresh operation: unknown ip: [%s], expected ip: [%s], refresh id: [%s]\n", r.RemoteAddr, claims["ip"], claims["refresh_id"])
+		log.Printf("unknown ip get access to refresh operation: unknown ip: [%s], expected ip: [%s], refresh id: [%s]\n", r.RemoteAddr, ip, refreshTokenFromReq)
 	}
 
-	//создание новой cookie с новым access токеном
-	cookieWithAccessToken, err := createCookieWithAccessToken(id, r.RemoteAddr, ah.Keys.Access)
-	if err != nil {
-		log.Printf("sign access token error: [%s]\n", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
+	//создание refresh токена
+	refreshToken, matchingKey := newRefreshToken()
 
-	//создание новой cookie с новым refresh токеном
-	newRefreshID := uuid.New()
-
-	cookieWithRefreshToken, err := createCookieWithRefreshToken(id, r.RemoteAddr, ah.Keys.Refresh, newRefreshID.String())
-	if err != nil {
-		log.Printf("sign refresh token error: [%s]\n", err.Error())
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	//добавление сформированного newRefreshID в базу к id пользователя
-	newHashedID, err := bcrypt.GenerateFromPassword([]byte(newRefreshID.String()), bcrypt.DefaultCost)
+	//добавление сформированного refresh token в базу
+	hashedRefreshToken, err = bcrypt.GenerateFromPassword([]byte(refreshToken), bcrypt.DefaultCost)
 	if err != nil {
 		log.Printf("error with generate bcrypt hash: [%s]\n", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	err = ah.Storage.AddNewRefreshID(id, newHashedID)
+	newExpDate := time.Now().AddDate(0, ah.RefreshExpMonths, 0)
+	err = ah.Storage.AddNewRefreshToken(id, hashedRefreshToken, newExpDate)
 	if err != nil {
-		log.Printf("error with add new hashed refresh id: [%s]\n", err.Error())
+		log.Printf("error with add new hashed refresh token to db: [%s]\n", err.Error())
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	http.SetCookie(w, cookieWithAccessToken)
-	http.SetCookie(w, cookieWithRefreshToken)
-	w.WriteHeader(http.StatusOK)
+	//создание подписанного access токена
+	signedAccessToken, err := createSignedAccessToken(id, ah.AccessExpMinutes, r.RemoteAddr, ah.AccessKey, matchingKey)
+	if err != nil {
+		log.Printf("create signed access token error: [%s]\n", err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	http.SetCookie(w, &http.Cookie{
+		Name:     "refresh_token",
+		Value:    refreshToken,
+		HttpOnly: true,
+		Path:     "/api/refresh",
+		Expires:  newExpDate,
+	})
+
+	response := Resp{"access_token": signedAccessToken}
+	responseData, err := json.Marshal(response)
+	if err != nil {
+		log.Printf("error with marshal reponse with access token: reponse [%v], error [%s]\n", response, err.Error())
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	w.Write(responseData)
 
 }

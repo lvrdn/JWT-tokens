@@ -2,6 +2,8 @@ package test
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -10,23 +12,34 @@ import (
 	"github.com/google/uuid"
 )
 
-var key = "anotherKey123!*"
+var key = "someKey1!"
 
 type AuthTestCase struct {
-	GUID         string
-	Path         string
+	GUID     string
+	Path     string
+	RT       *RefreshToken
+	AT       *AccessToken
+	Expected Response
+}
+
+type RefreshToken struct {
 	CookieUpdate func(*http.Cookie) *http.Cookie
 	NumCookieSt  int
-	Expected     Response
+}
+
+type AccessToken struct {
+	TokenUpdate func(string) string
+	NumTokenSt  int
 }
 
 type Response struct {
 	StatusCode int
-	GetCookies bool
+	GetCookie  bool
+	GetBody    bool
 }
 
 func TestApp(t *testing.T) {
-	cookiesStorage := make(map[int][]*http.Cookie)
+
 	cases := []*AuthTestCase{
 		{ //0. получение access и refresh токенов, guid, которого нет в бд
 			GUID: uuid.New().String(),
@@ -40,7 +53,8 @@ func TestApp(t *testing.T) {
 			Path: "http://127.0.0.1:8080/api/auth?guid=",
 			Expected: Response{
 				StatusCode: http.StatusOK,
-				GetCookies: true,
+				GetCookie:  true,
+				GetBody:    true,
 			},
 		},
 		{ //2. попытка обновить пару токенов, в запросе нет cookie с refresh токеном
@@ -49,127 +63,165 @@ func TestApp(t *testing.T) {
 				StatusCode: http.StatusBadRequest,
 			},
 		},
-		{ //3. попытка обновить пару токенов, у refresh токена истекло время жизни
+		{ //3. попытка обновить пару токенов, в заголовке запроса нет access токена
+			Path: "http://127.0.0.1:8080/api/refresh",
+			Expected: Response{
+				StatusCode: http.StatusBadRequest,
+			},
+		},
+		{ //4. попытка обновить пару токенов, неправильный refresh токен
 			Path: "http://127.0.0.1:8080/api/refresh",
 			Expected: Response{
 				StatusCode: http.StatusUnauthorized,
 			},
-			NumCookieSt: 1,
-			CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
-				claims := jwt.MapClaims{}
-				_, _ = jwt.ParseWithClaims(
-					cookie.Value,
-					&claims,
-					func(token *jwt.Token) (interface{}, error) {
-						return []byte(key), nil
-					},
-				)
-
-				claims["exp"] = claims["iat"] //время жизни == времени выдачи, т.е. токен уже "протух"
-				refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
-				signedRefreshToken, _ := refreshToken.SignedString([]byte(key))
-
-				return &http.Cookie{
-					Name:     cookie.Name,
-					Value:    signedRefreshToken,
-					HttpOnly: cookie.HttpOnly,
-					Path:     cookie.Path,
-					Expires:  cookie.Expires,
-				}
+			AT: &AccessToken{
+				NumTokenSt: 1,
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 1,
+				CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
+					return &http.Cookie{
+						Name:     cookie.Name,
+						Value:    "test",
+						HttpOnly: cookie.HttpOnly,
+						Path:     cookie.Path,
+						Expires:  cookie.Expires,
+					}
+				},
 			},
 		},
-		{ //4. попытка обновить пару токенов, у refresh токена id, отличный от того, что хранится в базе (проверка на "одноразовость" токена)
+		{ //5. попытка обновить пару токенов, refresh токен не совпадает с хешем из бд
 			Path: "http://127.0.0.1:8080/api/refresh",
 			Expected: Response{
 				StatusCode: http.StatusUnauthorized,
 			},
-			NumCookieSt: 1,
-			CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
-				claims := jwt.MapClaims{}
-				_, _ = jwt.ParseWithClaims(
-					cookie.Value,
-					&claims,
-					func(token *jwt.Token) (interface{}, error) {
-						return []byte(key), nil
-					},
-				)
+			AT: &AccessToken{
+				NumTokenSt: 1,
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 1,
+				CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
 
-				claims["refresh_id"] = uuid.New().String() //новый случайный id refresh токена
-				refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
-				signedRefreshToken, _ := refreshToken.SignedString([]byte(key))
+					refreshToken := cookie.Value
+					tokenData := strings.Split(refreshToken, ".")
+					tokenData[0] = "aaaaaaaaaaaaaaa"
 
-				return &http.Cookie{
-					Name:     cookie.Name,
-					Value:    signedRefreshToken,
-					HttpOnly: cookie.HttpOnly,
-					Path:     cookie.Path,
-					Expires:  cookie.Expires,
-				}
+					return &http.Cookie{
+						Name:     cookie.Name,
+						Value:    strings.Join(tokenData, "."),
+						HttpOnly: cookie.HttpOnly,
+						Path:     cookie.Path,
+						Expires:  cookie.Expires,
+					}
+				},
 			},
 		},
-		{ //5. попытка обновить пару токенов, у refresh токена изменен payload
+		{ //6. попытка обновить пару токенов, неправильный matching key
 			Path: "http://127.0.0.1:8080/api/refresh",
 			Expected: Response{
 				StatusCode: http.StatusUnauthorized,
 			},
-			NumCookieSt: 1,
-			CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
-				refreshToken := cookie.Value
-				s := strings.Split(refreshToken, ".")
-				payload, _ := base64.StdEncoding.DecodeString(s[1])
-				newPayload := strings.ReplaceAll(string(payload), "authApp", "unknownApp") //изменение payload
-				s[1] = base64.StdEncoding.EncodeToString([]byte(newPayload))
+			AT: &AccessToken{
+				NumTokenSt: 1,
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 1,
+				CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
 
-				return &http.Cookie{
-					Name:     cookie.Name,
-					Value:    strings.Join(s, "."),
-					HttpOnly: cookie.HttpOnly,
-					Path:     cookie.Path,
-					Expires:  cookie.Expires,
-				}
+					refreshToken := cookie.Value
+					tokenData := strings.Split(refreshToken, ".")
+					tokenData[1] = "aaaaa"
+
+					return &http.Cookie{
+						Name:     cookie.Name,
+						Value:    strings.Join(tokenData, "."),
+						HttpOnly: cookie.HttpOnly,
+						Path:     cookie.Path,
+						Expires:  cookie.Expires,
+					}
+				},
 			},
 		},
-		{ //6. обновление пары токенов, правильный refresh токен
+		{ //7. попытка обновить пару токенов, у access токена изменен payload, т.е. будет ошибка при проверке подписи
+			Path: "http://127.0.0.1:8080/api/refresh",
+			Expected: Response{
+				StatusCode: http.StatusUnauthorized,
+			},
+			AT: &AccessToken{
+				NumTokenSt: 1,
+				TokenUpdate: func(token string) string {
+					s := strings.Split(token, ".")
+					payload, _ := base64.StdEncoding.DecodeString(s[1])
+					newPayload := strings.ReplaceAll(string(payload), "authApp", "unknownApp") //изменение payload
+					s[1] = base64.StdEncoding.EncodeToString([]byte(newPayload))
+
+					return strings.Join(s, ".")
+				},
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 1,
+			},
+		},
+		{ //8. обновление пары токенов, правильный refresh токен
 			Path: "http://127.0.0.1:8080/api/refresh",
 			Expected: Response{
 				StatusCode: http.StatusOK,
-				GetCookies: true,
+				GetCookie:  true,
+				GetBody:    true,
 			},
-			NumCookieSt: 1,
-			CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
-				return cookie
+			AT: &AccessToken{
+				NumTokenSt: 1,
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 1,
 			},
 		},
-		{ //7. имитация обновления пары токенов с другого ip адреса
+		{ //9. попытка обновить пару токенов, используя старый refresh токен (полученный в кейсе 1)
+			Path: "http://127.0.0.1:8080/api/refresh",
+			Expected: Response{
+				StatusCode: http.StatusUnauthorized,
+			},
+			AT: &AccessToken{
+				NumTokenSt: 8,
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 1,
+			},
+		},
+		{ //10. имитация обновления пары токенов с другого ip адреса
 			Path: "http://127.0.0.1:8080/api/refresh",
 			Expected: Response{
 				StatusCode: http.StatusOK,
+				GetCookie:  true,
+				GetBody:    true,
 			},
-			NumCookieSt: 6,
-			CookieUpdate: func(cookie *http.Cookie) *http.Cookie {
-				claims := jwt.MapClaims{}
-				_, _ = jwt.ParseWithClaims(
-					cookie.Value,
-					&claims,
-					func(token *jwt.Token) (interface{}, error) {
-						return []byte(key), nil
-					},
-				)
+			AT: &AccessToken{
+				NumTokenSt: 8,
+				TokenUpdate: func(token string) string {
+					claims := jwt.MapClaims{}
+					_, _ = jwt.ParseWithClaims(
+						token,
+						&claims,
+						func(token *jwt.Token) (interface{}, error) {
+							return []byte(key), nil
+						},
+					)
 
-				claims["ip"] = "255.255.255.255" //новый ip
-				refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
-				signedRefreshToken, _ := refreshToken.SignedString([]byte(key))
+					claims["ip"] = "255.255.255.255" //новый ip
+					newToken := jwt.NewWithClaims(jwt.SigningMethodHS512, claims)
+					signedRefreshToken, _ := newToken.SignedString([]byte(key))
 
-				return &http.Cookie{
-					Name:     cookie.Name,
-					Value:    signedRefreshToken,
-					HttpOnly: cookie.HttpOnly,
-					Path:     cookie.Path,
-					Expires:  cookie.Expires,
-				}
+					return signedRefreshToken
+				},
+			},
+			RT: &RefreshToken{
+				NumCookieSt: 8,
 			},
 		},
 	}
+
+	cookiesStorage := make(map[int]*http.Cookie)
+	accessTokenStorage := make(map[int]string)
 
 	for i, testCase := range cases {
 		client := &http.Client{}
@@ -178,14 +230,20 @@ func TestApp(t *testing.T) {
 			t.Fatalf("make request error, num case: [%d], error msg: [%s]", i, err.Error())
 		}
 
-		if testCase.CookieUpdate != nil {
-			for _, cookie := range cookiesStorage[testCase.NumCookieSt] {
-				if cookie.Name == "refresh_token" {
-					updatedCookie := testCase.CookieUpdate(cookie)
-					req.AddCookie(updatedCookie)
-					break
-				}
+		if testCase.AT != nil {
+			accessToken := accessTokenStorage[testCase.AT.NumTokenSt]
+			if testCase.AT.TokenUpdate != nil {
+				accessToken = testCase.AT.TokenUpdate(accessToken)
 			}
+			req.Header.Set("access_token", accessToken)
+		}
+
+		if testCase.RT != nil {
+			cookieWithRefreshToken := cookiesStorage[testCase.RT.NumCookieSt]
+			if testCase.RT.CookieUpdate != nil {
+				cookieWithRefreshToken = testCase.RT.CookieUpdate(cookieWithRefreshToken)
+			}
+			req.AddCookie(cookieWithRefreshToken)
 		}
 
 		resp, err := client.Do(req)
@@ -196,13 +254,31 @@ func TestApp(t *testing.T) {
 			t.Fatalf("unexpected status code: num case: [%d], expected [%d], got [%d]", i, testCase.Expected.StatusCode, resp.StatusCode)
 		}
 
-		if testCase.Expected.GetCookies && len(resp.Cookies()) == 0 {
-			t.Fatalf("response must have cookie in this num case [%d], but cookies are absent", i)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("body read error, num case: [%d], error msg: [%s]", i, err.Error())
 		}
 
-		if len(resp.Cookies()) != 0 {
-			cookiesStorage[i] = resp.Cookies()
+		if testCase.Expected.GetCookie {
+			if len(resp.Cookies()) != 1 {
+				t.Fatalf("response must have cookie in this num case [%d], but cookies are absent", i)
+			} else {
+				cookiesStorage[i] = resp.Cookies()[0]
+			}
 		}
+
+		if testCase.Expected.GetBody {
+			if string(body) == "" {
+				t.Fatalf("response must have body with access token in this num case [%d], but body is empty", i)
+			} else {
+				var m map[string]string
+				_ = json.Unmarshal(body, &m)
+				if token, ok := m["access_token"]; ok {
+					accessTokenStorage[i] = token
+				}
+			}
+		}
+		resp.Body.Close()
 	}
 
 }
